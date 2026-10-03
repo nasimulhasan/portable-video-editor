@@ -1,0 +1,5 @@
+# The editor server uses only the Python standard library (3.10+).
+# pywebview is needed for the desktop window (portable\host.py).
+pywebview>=5.0
+# Taskbar pin / AppUserModelID support on Windows
+pywin32>=306; sys_platform == "win32"

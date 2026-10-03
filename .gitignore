@@ -1,0 +1,11 @@
+# FFmpeg binaries are >100 MB (GitHub limit) — shipped in the release ZIP instead
+bin/
+portable/dist/
+portable/_build_tmp/
+release/
+
+_test/
+codex/
+__pycache__/
+*.pyc
+.encoder-cache.json
