@@ -166,6 +166,111 @@ function shrinkTextToFitBox(t, el, sh) {
   t.size = fs / sh;
 }
 
+/**
+ * Render a text overlay to a PNG at export resolution (frame W×H) so the export matches the preview:
+ * the browser lays the text out with the same box styles as #ovLayer .ovText, then each line is
+ * painted onto a canvas. Returns a PNG data URL of the (rotated) box, or null for empty text.
+ */
+async function rasterizeText(t, W, H) {
+  ensureTextBox(t);
+  const text = String(t.text || "").replace(/\r\n?/g, "\n");
+  if (!text.trim()) return null;
+  const family = fontCss(t.font);
+  const weight = fontWeight(t.font);
+  const fs = Math.max(1, (Number(t.size) || 0.08) * H);
+  const font = `${weight} ${fs}px ${family}`;
+  try { await document.fonts.load(font, text); } catch (_) { /* fall back to whatever is available */ }
+
+  const bw = Math.max(1, Math.round(t.scaleW * W));
+  const bh = Math.max(1, Math.round(t.scaleH * H));
+  const box = document.createElement("div");
+  Object.assign(box.style, {
+    position: "fixed", left: "-100000px", top: "0", visibility: "hidden",
+    display: "flex", alignItems: "center", justifyContent: "center", boxSizing: "border-box",
+    padding: "0.2em 0.35em", textAlign: "center", overflow: "hidden",
+    width: bw + "px", height: bh + "px", fontFamily: family, fontWeight: weight, fontSize: fs + "px",
+  });
+  const inner = document.createElement("div");
+  Object.assign(inner.style, {
+    whiteSpace: "pre-wrap", wordBreak: "break-word", overflowWrap: "anywhere", maxWidth: "100%",
+    lineHeight: String(t.lineGap), textAlign: "center",
+  });
+  inner.textContent = text;
+  box.appendChild(inner);
+  document.body.appendChild(box);
+
+  // Group characters into the line boxes the browser produced (handles wrapping and explicit newlines).
+  const lines = [];
+  try {
+    const node = inner.firstChild;
+    const origin = box.getBoundingClientRect();
+    const range = document.createRange();
+    let cur = null;
+    for (let i = 0; i < text.length;) {
+      const n = text.codePointAt(i) > 0xffff ? 2 : 1;
+      const ch = text.slice(i, i + n);
+      if (ch === "\n") {
+        cur = null;
+      } else {
+        range.setStart(node, i);
+        range.setEnd(node, i + n);
+        const r = range.getClientRects()[0];
+        if (r) {
+          if (!cur || Math.abs(r.top - cur.top) > fs * 0.3) {
+            cur = { text: "", left: r.left - origin.left, top: r.top - origin.top };
+            lines.push(cur);
+          }
+          cur.text += ch;
+        }
+      }
+      i += n;
+    }
+  } finally {
+    box.remove();
+  }
+
+  const c = document.createElement("canvas");
+  c.width = bw;
+  c.height = bh;
+  const g = c.getContext("2d");
+  if (t.box) {
+    g.fillStyle = shadowRgba(t.boxColor || "#000000", t.boxAlpha != null ? Number(t.boxAlpha) : 0.5);
+    g.beginPath();
+    g.roundRect(0, 0, bw, bh, 0.12 * fs);
+    g.fill();
+  }
+  g.font = font;
+  g.textAlign = "left";
+  g.textBaseline = "alphabetic";
+  const ascent = g.measureText("H").fontBoundingBoxAscent;
+  g.fillStyle = t.color || "#ffffff";
+  if (t.shadow) {
+    g.shadowColor = shadowRgba(t.shadowColor || "#000000");
+    g.shadowOffsetX = g.shadowOffsetY = TEXT_SHADOW_OFFSET * H;
+    g.shadowBlur = TEXT_SHADOW_BLUR * H;
+  }
+  for (const ln of lines) g.fillText(ln.text, ln.left, ln.top + ascent);
+  g.shadowColor = "transparent";
+  if (Number(t.strokeW) > 0) {
+    g.lineWidth = Number(t.strokeW) * (H / 1080);
+    g.strokeStyle = t.stroke || "#000000";
+    for (const ln of lines) g.strokeText(ln.text, ln.left, ln.top + ascent);
+  }
+
+  const rad = ((Number(t.rotate) || 0) * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.ceil(bw * cos + bh * sin));
+  out.height = Math.max(1, Math.ceil(bw * sin + bh * cos));
+  const og = out.getContext("2d");
+  og.globalAlpha = Math.max(0, Math.min(Number(t.opacity ?? 1), 1));
+  og.translate(out.width / 2, out.height / 2);
+  og.rotate(rad);
+  og.drawImage(c, -bw / 2, -bh / 2);
+  return out.toDataURL("image/png");
+}
+
 function applyPresetBox(item, pr) {
   item.x = pr.x; item.y = pr.y;
   item.scaleW = pr.scaleW != null ? pr.scaleW : pr.scale;
@@ -2159,7 +2264,7 @@ function renderOverlays() {
     d.style.opacity = t.opacity;
     d.style.transform = `translate(-50%,-50%) rotate(${t.rotate || 0}deg)`;
     if (t.strokeW > 0) d.style.webkitTextStroke = `${t.strokeW * (sh / 1080)}px ${t.stroke}`;
-    d.style.textShadow = t.shadow ? cssTextShadow(t.shadowColor || "#000000") : "none";
+    d.style.textShadow = t.shadow ? cssTextShadow(t.shadowColor || "#000000", sh) : "none";
     if (t.box) {
       const a = Math.round(t.boxAlpha * 255).toString(16).padStart(2, "0");
       d.style.background = t.boxColor + a;
@@ -2270,7 +2375,7 @@ function subPreviewTick() {
   el.style.color = st.color || "#ffffff";
   el.style.opacity = st.opacity != null ? st.opacity : 1;
   el.style.webkitTextStroke = st.strokeW > 0 && !st.box ? `${st.strokeW * (sh / 1080)}px ${st.stroke || "#000"}` : "";
-  el.style.textShadow = st.shadow ? cssTextShadow(st.shadowColor || "#000000") : "none";
+  el.style.textShadow = st.shadow ? cssTextShadow(st.shadowColor || "#000000", sh) : "none";
   if (st.box) {
     const a = Math.round((st.boxAlpha != null ? st.boxAlpha : 0.55) * 255).toString(16).padStart(2, "0");
     el.style.background = (st.boxColor || "#000000") + a;
@@ -3358,14 +3463,18 @@ function colorField(id, value) {
     + `<input type="text" class="hex" id="${id}Hex" value="${hex.toUpperCase()}" maxlength="7" spellcheck="false" title="HEX">`
     + `</span>`;
 }
-/** CSS text-shadow from hex (default black @ 60% opacity). */
-function cssTextShadow(hex, alpha) {
+/** Text shadow offset/blur as a fraction of frame height (≈2px / 4px on a 540px-tall stage). */
+const TEXT_SHADOW_OFFSET = 2 / 540;
+const TEXT_SHADOW_BLUR = 4 / 540;
+function shadowRgba(hex, alpha) {
   const c = normHex(hex || "#000000").slice(1);
   const a = alpha != null ? alpha : 0.6;
-  const r = parseInt(c.slice(0, 2), 16);
-  const g = parseInt(c.slice(2, 4), 16);
-  const b = parseInt(c.slice(4, 6), 16);
-  return `2px 2px 4px rgba(${r},${g},${b},${a})`;
+  return `rgba(${parseInt(c.slice(0, 2), 16)},${parseInt(c.slice(2, 4), 16)},${parseInt(c.slice(4, 6), 16)},${a})`;
+}
+/** CSS text-shadow scaled to a frame of height `frameH` px (default black @ 60% opacity). */
+function cssTextShadow(hex, frameH, alpha) {
+  const o = TEXT_SHADOW_OFFSET * frameH;
+  return `${o}px ${o}px ${TEXT_SHADOW_BLUR * frameH}px ${shadowRgba(hex, alpha)}`;
 }
 function bindColor(id, obj, key, after) {
   const inp = document.getElementById(id);
@@ -4870,12 +4979,23 @@ async function doExport() {
   }
 
   $("#exportModal").hidden = true;
+  $("#exportStatus").textContent = "Preparing text…";
+  const [frameW, frameH] = previewCanvasSize();
+  const texts = await Promise.all(state.texts.map(async (t) => {
+    try {
+      const png = await rasterizeText(t, frameW, frameH);
+      return png ? { ...t, _png: png, _rasterH: frameH } : t;
+    } catch (err) {
+      console.warn("Text raster failed; exporting with subtitle renderer instead.", err);
+      return t;
+    }
+  }));
   const project = {
     canvas: state.canvas,
     clips: state.clips,
     music: state.music,
     pips: state.pips,
-    texts: state.texts,
+    texts,
     shapes: state.shapes,
     images: state.images,
     subs: state.subs,

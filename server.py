@@ -12,6 +12,8 @@ Zero pip dependencies. Run:  python server.py
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import mimetypes
 import os
@@ -1374,8 +1376,9 @@ def resolve_font(name: str) -> tuple[str, int]:
     return name, 0
 
 
-def build_ass(project: dict, W: int, H: int) -> str | None:
-    texts = project.get("texts") or []
+def build_ass(project: dict, W: int, H: int, texts: list[dict] | None = None) -> str | None:
+    if texts is None:
+        texts = project.get("texts") or []
     subs = project.get("subs") or {}
     entries = subs.get("entries") or []
     if not texts and not entries:
@@ -1472,6 +1475,23 @@ def build_ass(project: dict, W: int, H: int) -> str | None:
         *events,
         "",
     ])
+
+
+def save_text_raster(t: dict) -> Path | None:
+    """Write the editor-rendered PNG of a text overlay (data URL in `_png`) to a temp file."""
+    data_url = t.get("_png")
+    if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
+        return None
+    try:
+        raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if not raw.startswith(b"\x89PNG"):
+        return None
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    path = PROXY_DIR / (uuid.uuid4().hex + ".png")
+    path.write_bytes(raw)
+    return path
 
 
 def filter_path(p: str) -> str:
@@ -1636,11 +1656,10 @@ def build_export(project: dict, enc: Encoder, dest: str) -> tuple[list[str], flo
             cur_v, cur_a = "vbase", "abase"
             for k in range(len(clips)):
                 off = offsets[k]
-                # Delay clip to its timeline start, then overlay / amix.
+                # Delay clip to its timeline start, then overlay / amix. Shift timestamps rather than
+                # padding: a padded lead-in is opaque and would hide the clips underneath.
                 if off > 0.001:
-                    parts.append(
-                        f"[v{k}]tpad=start_mode=add:start_duration={off:.4f}:color={color}[vd{k}]"
-                    )
+                    parts.append(f"[v{k}]setpts=PTS+{off:.4f}/TB[vd{k}]")
                     delay_ms = int(round(off * 1000))
                     parts.append(f"[a{k}]adelay={delay_ms}|{delay_ms},aformat=sample_fmts=fltp:channel_layouts=stereo[ad{k}]")
                 else:
@@ -1789,7 +1808,33 @@ def build_export(project: dict, enc: Encoder, dest: str) -> tuple[list[str], flo
     # master LUT after picture, before titles so text stays readable
     cur_v = apply_lut_filter(parts, cur_v, (project.get("canvas") or {}).get("lut"), "vlut")
 
-    ass = build_ass(project, W, H)
+    # Texts the editor rasterized (same rendering as the preview); anything else falls back to ASS.
+    ass_texts: list[dict] = []
+    next_input = len(mids) + len(shapes)
+    for j, t in enumerate(texts):
+        png = save_text_raster(t)
+        if not png:
+            ass_texts.append(t)
+            continue
+        inputs += ["-i", str(png)]
+        chain = f"[{next_input}:v]format=rgba"
+        next_input += 1
+        raster_h = float(t.get("_rasterH") or H)
+        if abs(raster_h - H) > 0.5:
+            k = H / raster_h
+            chain += f",scale=trunc(iw*{k:.6f}):trunc(ih*{k:.6f})"
+        parts.append(chain + f"[txi{j}]")
+        start = float(t.get("start", 0))
+        end = start + float(t.get("durn", 3))
+        x = float(t.get("x", 0.5))
+        y = float(t.get("y", 0.85))
+        parts.append(
+            f"[{cur_v}][txi{j}]overlay=x=(W*{x:.4f})-(w/2):y=(H*{y:.4f})-(h/2)"
+            f":enable='between(t,{start:.3f},{end:.3f})'[vtx{j}]"
+        )
+        cur_v = f"vtx{j}"
+
+    ass = build_ass(project, W, H, ass_texts)
     if ass:
         PROXY_DIR.mkdir(parents=True, exist_ok=True)
         ass_path = PROXY_DIR / (uuid.uuid4().hex + ".ass")
