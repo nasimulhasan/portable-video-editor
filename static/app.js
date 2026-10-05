@@ -870,6 +870,7 @@ const state = {
 };
 
 const audioCache = {};   // mid -> Audio element
+const pipVideoCache = {};  // uid -> <video>
 let pps = 50;
 let activeClip = -1;
 let gesture = null;
@@ -1038,6 +1039,28 @@ function getAudio(m) {
     audioCache[key].preload = "auto";
   }
   return audioCache[key];
+}
+/** Fully stop a media element so its decoder and HTTP connection are freed. */
+function releaseMediaEl(el) {
+  if (!el) return;
+  try { el.pause(); } catch (_) {}
+  try { el.removeAttribute("src"); el.load(); } catch (_) {}
+  if (el.parentNode) el.parentNode.removeChild(el);
+}
+/**
+ * Free players for items that no longer exist (deleted, split, undone).
+ * WebView2 allows only 6 connections to the local server; leaked players
+ * hold them open until the main video can no longer load.
+ */
+function gcMediaCaches() {
+  const liveAudio = new Set(state.music.map((m) => m.uid || m.mid));
+  for (const key of Object.keys(audioCache)) {
+    if (!liveAudio.has(key)) { releaseMediaEl(audioCache[key]); delete audioCache[key]; }
+  }
+  const livePip = new Set(state.pips.map((p) => p.uid));
+  for (const key of Object.keys(pipVideoCache)) {
+    if (!livePip.has(key)) { releaseMediaEl(pipVideoCache[key]); delete pipVideoCache[key]; }
+  }
 }
 
 /* ---------- undo / redo ---------- */
@@ -1248,7 +1271,7 @@ function pipToClip(pipIndex, opts) {
     clip.x = 0.5; clip.y = 0.5; clip.scaleW = 1; clip.scaleH = 1; clip.scale = 1;
   }
   if (pipVideoCache[p.uid]) {
-    try { pipVideoCache[p.uid].pause(); } catch (_) {}
+    releaseMediaEl(pipVideoCache[p.uid]);
     delete pipVideoCache[p.uid];
   }
   if (state.sel && state.sel.type === "pip") {
@@ -1875,11 +1898,27 @@ function applyClipFX() {
 }
 
 let lastFrame = 0;
+let stallSince = 0;
+/** Drop and re-open the main video source (recovers a stuck load). */
+function reloadMainVideo() {
+  gcMediaCaches();
+  try { video.pause(); } catch (_) {}
+  video.removeAttribute("src");
+  try { video.load(); } catch (_) {}
+  delete video.dataset.mid;
+  syncPreview(state.playing);
+}
+video.addEventListener("error", () => {
+  // Next sync re-opens the source instead of waiting on a dead element.
+  delete video.dataset.mid;
+});
 function play() {
   if (contentEnd() <= 0.05) return;
   if (state.t >= contentEnd() - 0.05) state.t = 0;
   state.playing = true;
   lastFrame = 0;
+  stallSince = 0;
+  if (video.error) delete video.dataset.mid;
   $("#playBtn").textContent = "⏸";
   syncPreview(true);
   requestAnimationFrame(loop);
@@ -1933,7 +1972,13 @@ function loop() {
     } else {
       // Still loading / seeking — hold playhead; don't advance by wall-clock.
       lastFrame = now;
+      if (!stallSince) stallSince = now;
+      else if (now - stallSince > 3000) {
+        stallSince = 0;
+        reloadMainVideo();
+      }
     }
+    if (video.readyState >= 2 && !video.seeking) stallSince = 0;
   } else {
     // Gap between clips, or only overlays/images left — wall-clock time.
     if (lastFrame) state.t += (now - lastFrame) / 1000;
@@ -1963,7 +2008,6 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-const pipVideoCache = {};  // uid -> <video>
 function getPipVideo(p) {
   let v = pipVideoCache[p.uid];
   if (!v) {
@@ -4231,7 +4275,7 @@ function deleteSelected() {
   else if (type === "sub") state.subs.entries.splice(i, 1);
   else if (type === "pip") {
     const p = state.pips[i];
-    if (pipVideoCache[p.uid]) { pipVideoCache[p.uid].pause(); delete pipVideoCache[p.uid]; }
+    if (pipVideoCache[p.uid]) { releaseMediaEl(pipVideoCache[p.uid]); delete pipVideoCache[p.uid]; }
     state.pips.splice(i, 1);
   }
   state.sel = null;
@@ -4347,6 +4391,7 @@ async function autoSilence(c) {
 /* ---------- refresh ---------- */
 
 function refresh() {
+  gcMediaCaches();
   renderTimeline();
   renderInspector();
   renderOverlays();

@@ -2129,8 +2129,13 @@ def load_project(path: str) -> dict:
 
 # ---------- HTTP ----------
 
+MEDIA_CHUNK = 8 * 1024 * 1024
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Drop connections a player stopped reading, instead of holding them forever
+    timeout = 60
 
     def log_message(self, *args) -> None:
         pass
@@ -2176,7 +2181,12 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 if m.group(1):
                     start = int(m.group(1))
-                    end = int(m.group(2)) if m.group(2) else size - 1
+                    if m.group(2):
+                        end = int(m.group(2))
+                    else:
+                        # Open-ended range: answer in chunks so the browser's few
+                        # per-host connections are released quickly; it asks for more.
+                        end = start + MEDIA_CHUNK - 1
                 elif m.group(2):
                     start = max(0, size - int(m.group(2)))
                 end = min(end, size - 1)
@@ -2204,8 +2214,8 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-            pass
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
 
     def do_GET(self) -> None:  # noqa: N802
         url = urlparse(self.path)
